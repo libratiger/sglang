@@ -43,10 +43,14 @@ class ModelConfig:
         is_embedding: Optional[bool] = None,
         dtype: str = "auto",
         quantization: Optional[str] = None,
+        pipeline_parallel_size: int = 1,
+        pipeline_stage_rank: int = 0,
     ) -> None:
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
+        self.pipeline_parallel_size = pipeline_parallel_size
+        self.pipeline_stage_rank = pipeline_stage_rank
         # Parse args
         self.model_override_args = json.loads(model_override_args)
         self.hf_config = get_config(
@@ -121,7 +125,18 @@ class ModelConfig:
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
-        self.num_hidden_layers = self.hf_text_config.num_hidden_layers
+        
+        # Pipeline parallelism attributes
+        if self.hf_text_config.num_hidden_layers % self.pipeline_parallel_size != 0:
+            raise ValueError(
+                f"For now, the number of layers ({self.hf_text_config.num_hidden_layers}) "
+                f"must be perfectly divisible by pipeline_parallel_size ({self.pipeline_parallel_size})."
+            )
+        layers_per_stage = self.hf_text_config.num_hidden_layers // self.pipeline_parallel_size
+        self.layer_offset = self.pipeline_stage_rank * layers_per_stage
+        self.effective_num_hidden_layers = layers_per_stage
+        self.num_hidden_layers = self.effective_num_hidden_layers # Overwrite with effective number of layers for this stage
+
         self.vocab_size = self.hf_text_config.vocab_size
 
         # Veirfy quantization

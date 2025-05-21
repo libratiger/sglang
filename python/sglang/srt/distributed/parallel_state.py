@@ -903,6 +903,9 @@ def init_model_parallel_group(
 _TP: Optional[GroupCoordinator] = None
 
 
+_PIPELINE_GLOBAL_RANKS: Optional[List[List[int]]] = None
+
+
 def get_tp_group() -> GroupCoordinator:
     assert _TP is not None, "tensor model parallel group is not initialized"
     return _TP
@@ -923,6 +926,101 @@ def get_pp_group() -> GroupCoordinator:
 get_pipeline_model_parallel_group = get_pp_group
 
 
+def init_pipeline_parallel_state(
+    pipeline_parallel_size: int,
+    tensor_parallel_size: int,
+) -> None:
+    """
+    Initializes the global rank mapping for pipeline stages.
+    This function should be called after init_distributed_environment.
+    """
+    global _PIPELINE_GLOBAL_RANKS
+    if _PIPELINE_GLOBAL_RANKS is not None:
+        # Already initialized, perhaps log a warning or ensure consistency
+        return
+
+    world_size = torch.distributed.get_world_size()
+    if world_size != pipeline_parallel_size * tensor_parallel_size:
+        # Assuming DP size is 1 for now. If DP is used, this calculation needs adjustment.
+        # For now, we raise an error if it doesn't match, implying DP is not yet supported with PP.
+        raise RuntimeError(
+            f"World size ({world_size}) does not match pipeline_parallel_size ({pipeline_parallel_size}) * "
+            f"tensor_parallel_size ({tensor_parallel_size}). Data parallelism is not yet accounted for in pipeline state init."
+        )
+
+    _PIPELINE_GLOBAL_RANKS = [
+        [0] * tensor_parallel_size for _ in range(pipeline_parallel_size)
+    ]
+    for pp_rank in range(pipeline_parallel_size):
+        for tp_rank in range(tensor_parallel_size):
+            # This assumes contiguous ranks for stages, then TP ranks within each stage.
+            # E.g., Stage 0 (TP0, TP1), Stage 1 (TP0, TP1) -> Ranks (0,1), (2,3)
+            # This is consistent with how VLLM and Megatron-LM typically arrange ranks.
+            # global_rank = pp_rank * tensor_parallel_size + tp_rank
+            # The VLLM/Megatron-LM convention is TP ranks are inner dimension, PP ranks are outer.
+            # ranks for a pp group i: [i, i + tp_size, i + 2*tp_size, ...]
+            # ranks for a tp group j: [j*tp_size, j*tp_size+1, ..., (j+1)*tp_size-1]
+            # So, the global rank for (pp_stage_j, tp_rank_i) is j * tp_size + i.
+            # This seems correct.
+            _PIPELINE_GLOBAL_RANKS[pp_rank][tp_rank] = (
+                pp_rank * tensor_parallel_size + tp_rank
+            )
+
+
+def get_pipeline_stage_global_rank(pipeline_stage_rank: int, tp_rank: int) -> int:
+    """
+    Returns the global rank for a given pipeline stage and tensor parallel rank.
+    """
+    assert _PIPELINE_GLOBAL_RANKS is not None, "Pipeline parallel state not initialized."
+    if not (0 <= pipeline_stage_rank < len(_PIPELINE_GLOBAL_RANKS)):
+        raise ValueError(f"Invalid pipeline_stage_rank: {pipeline_stage_rank}")
+    if not (0 <= tp_rank < len(_PIPELINE_GLOBAL_RANKS[0])):
+        raise ValueError(f"Invalid tp_rank: {tp_rank}")
+    return _PIPELINE_GLOBAL_RANKS[pipeline_stage_rank][tp_rank]
+
+
+def get_prev_stage_global_ranks(
+    current_stage_rank: int, tp_size: int
+) -> Optional[List[int]]:
+    """
+    Returns a list of global ranks for the previous stage across all TP ranks.
+    Returns None if the current stage is the first stage.
+    """
+    assert _PIPELINE_GLOBAL_RANKS is not None, "Pipeline parallel state not initialized."
+    if current_stage_rank == 0:
+        return None
+    prev_stage_rank = current_stage_rank - 1
+    if not (0 <= prev_stage_rank < len(_PIPELINE_GLOBAL_RANKS)):
+        # This should not happen if current_stage_rank > 0
+        raise ValueError(f"Calculated previous stage rank {prev_stage_rank} is invalid.")
+    
+    ranks = []
+    for tp_rank_iter in range(tp_size):
+        ranks.append(get_pipeline_stage_global_rank(prev_stage_rank, tp_rank_iter))
+    return ranks
+
+
+def get_next_stage_global_ranks(
+    current_stage_rank: int, pp_size: int, tp_size: int
+) -> Optional[List[int]]:
+    """
+    Returns a list of global ranks for the next stage across all TP ranks.
+    Returns None if the current stage is the last stage.
+    """
+    assert _PIPELINE_GLOBAL_RANKS is not None, "Pipeline parallel state not initialized."
+    if current_stage_rank == pp_size - 1:
+        return None
+    next_stage_rank = current_stage_rank + 1
+    if not (0 <= next_stage_rank < len(_PIPELINE_GLOBAL_RANKS)):
+         # This should not happen if current_stage_rank < pp_size - 1
+        raise ValueError(f"Calculated next stage rank {next_stage_rank} is invalid.")
+
+    ranks = []
+    for tp_rank_iter in range(tp_size):
+        ranks.append(get_pipeline_stage_global_rank(next_stage_rank, tp_rank_iter))
+    return ranks
+
+
 @contextmanager
 def graph_capture():
     """
@@ -938,9 +1036,14 @@ def graph_capture():
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
-    with get_tp_group().graph_capture() as context, get_pp_group().graph_capture(
+    # If PP group is None (e.g. when pp_size is 1), use nullcontext
+    pp_group_context = nullcontext()
+    if _PP is not None:
+        pp_group_context = get_pp_group().graph_capture
+
+    with get_tp_group().graph_capture() as context, pp_group_context(
         context
-    ):
+    ) if _PP is not None else nullcontext() : # Check _PP again for safety
         yield context
 
 
@@ -1007,7 +1110,8 @@ def initialize_model_parallel(
     backend: Optional[str] = None,
 ) -> None:
     """
-    Initialize model parallel groups.
+    Initialize model parallel groups (TP and PP).
+    This function also initializes the pipeline parallel state (_PIPELINE_GLOBAL_RANKS).
 
     Arguments:
         tensor_model_parallel_size: number of GPUs used for tensor model
@@ -1040,20 +1144,26 @@ def initialize_model_parallel(
             f"pipeline_model_parallel_size ({pipeline_model_parallel_size})"
         )
 
+    # Initialize pipeline parallel state first, as it defines global rank structure
+    init_pipeline_parallel_state(pipeline_model_parallel_size, tensor_model_parallel_size)
+
     # Build the tensor model-parallel groups.
-    num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
+    # A TP group is a set of ranks with the same PP stage rank.
+    # Ranks for TP group `j` (where `j` is the PP stage rank):
+    # [ j * TP_SIZE, j * TP_SIZE + 1, ..., (j+1) * TP_SIZE - 1 ]
+    # There are `PP_SIZE` such TP groups.
     global _TP
     assert _TP is None, "tensor model parallel group is already initialized"
-    group_ranks = []
-    for i in range(num_tensor_model_parallel_groups):
+    tp_group_ranks_list = []
+    for pp_idx in range(pipeline_model_parallel_size):
         ranks = list(
-            range(i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size)
+            range(pp_idx * tensor_model_parallel_size, (pp_idx + 1) * tensor_model_parallel_size)
         )
-        group_ranks.append(ranks)
+        tp_group_ranks_list.append(ranks)
 
     # message queue broadcaster is only used in tensor model parallel group
     _TP = init_model_parallel_group(
-        group_ranks,
+        tp_group_ranks_list, # Pass all potential TP groups
         get_world_group().local_rank,
         backend,
         use_message_queue_broadcaster=True,
@@ -1061,19 +1171,24 @@ def initialize_model_parallel(
     )
 
     # Build the pipeline model-parallel groups.
-    num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
+    # A PP group is a set of ranks with the same TP rank.
+    # Ranks for PP group `i` (where `i` is the TP rank):
+    # [ i, i + TP_SIZE, i + 2*TP_SIZE, ..., i + (PP_SIZE-1)*TP_SIZE ]
+    # There are `TP_SIZE` such PP groups.
     global _PP
     assert _PP is None, "pipeline model parallel group is already initialized"
-    group_ranks = []
-    for i in range(num_pipeline_model_parallel_groups):
-        ranks = list(range(i, world_size, num_pipeline_model_parallel_groups))
-        group_ranks.append(ranks)
-    # pipeline parallel does not need custom allreduce
+    pp_group_ranks_list = []
+    for tp_idx in range(tensor_model_parallel_size):
+        ranks = list(range(tp_idx, world_size, tensor_model_parallel_size))
+        pp_group_ranks_list.append(ranks)
+        
+    # pipeline parallel does not need custom allreduce for its main process group
+    # (though individual send/recv don't use custom AR anyway)
     _PP = init_model_parallel_group(
-        group_ranks,
+        pp_group_ranks_list, # Pass all potential PP groups
         get_world_group().local_rank,
         backend,
-        use_custom_allreduce=False,
+        use_custom_allreduce=False, # Typically False for PP group itself
         group_name="pp",
     )
 

@@ -67,10 +67,17 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.managers.session_controller import Session
-from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.managers.tp_worker import TpModelWorker, ModelWorkerBatch
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
+from sglang.srt.managers.pipeline_stage_executor import PipelineStageExecutor
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.distributed.parallel_state import (
+    get_pipeline_stage_global_rank,
+    get_prev_stage_global_ranks, # We might need these later for group send/recv
+    get_next_stage_global_ranks, # We might need these later for group send/recv
+    get_tp_group,
+)
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -106,7 +113,7 @@ class Scheduler:
         # Parse args
         self.server_args = server_args
         self.tp_rank = tp_rank
-        self.tp_size = server_args.tp_size
+        self.tp_size = server_args.tp_size # This is TP size per stage if PP is enabled
         self.schedule_policy = server_args.schedule_policy
         self.disable_jump_forward = server_args.disable_jump_forward
         self.lora_paths = server_args.lora_paths
@@ -114,11 +121,12 @@ class Scheduler:
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
+        self.port_args = port_args # Store port_args
 
         # Init inter-process communication
         context = zmq.Context(2)
 
-        if self.tp_rank == 0 or self.server_args.enable_dp_attention:
+        if self.tp_rank == 0 or self.server_args.enable_dp_attention: # TODO: Check if dp_attention needs this for PP
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name
             )
@@ -127,12 +135,10 @@ class Scheduler:
             )
 
             if server_args.skip_tokenizer_init:
-                # Directly send to the tokenizer/api
                 self.send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.tokenizer_ipc_name
                 )
             else:
-                # Send to the detokenizer
                 self.send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.detokenizer_ipc_name
                 )
@@ -140,24 +146,118 @@ class Scheduler:
             self.recv_from_tokenizer = None
             self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
+        
+        self.pipeline_stages: List[PipelineStageExecutor] = []
 
-        # Init tokenizer
-        self.model_config = ModelConfig(
-            server_args.model_path,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-            context_length=server_args.context_length,
-            model_override_args=server_args.json_model_override_args,
-            is_embedding=server_args.is_embedding,
-            dtype=server_args.dtype,
-            quantization=server_args.quantization,
-        )
-        self.is_generation = self.model_config.is_generation
+        if self.server_args.pipeline_parallel_size > 1:
+            for pp_rank in range(self.server_args.pipeline_parallel_size):
+                # Create stage-specific ModelConfig
+                # Note: server_args.model_path, trust_remote_code, revision, etc., are used directly.
+                # Key pipeline-specific args are pipeline_parallel_size and pipeline_stage_rank.
+                mconfig = ModelConfig(
+                    model_path=server_args.model_path,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                    context_length=server_args.context_length,
+                    model_override_args=server_args.json_model_override_args,
+                    is_embedding=server_args.is_embedding,
+                    dtype=server_args.dtype,
+                    quantization=server_args.quantization,
+                    pipeline_parallel_size=server_args.pipeline_parallel_size,
+                    pipeline_stage_rank=pp_rank,
+                )
+                # Each stage executor will initialize its own ModelRunner, which includes torch.distributed setup
+                # for its TP group. The nccl_port might need careful handling if stages are on different nodes
+                # or if we want separate NCCL communicators per stage's TP group.
+                # For now, assume all TP groups within a scheduler (if it spans nodes, which it doesn't yet)
+                # can coordinate using the same base nccl_port logic or that ModelRunner handles it.
+                stage_executor = PipelineStageExecutor(
+                    mconfig, self.server_args, self.tp_rank, self.port_args.nccl_port
+                )
+                self.pipeline_stages.append(stage_executor)
+            
+            # Adapt how model_config, worker info, memory pools are accessed
+            self.model_config = self.pipeline_stages[0].model_config # Use stage 0's config as the "main" one for scheduler
+            self.is_generation = self.model_config.is_generation
 
+            # Get worker info from the first stage for now for things like max_total_tokens
+            # This will need refinement. For example, max_total_tokens might be per stage.
+            # For now, let's assume stage 0's info is representative for scheduler-level decisions.
+            worker_info_stage0 = self.pipeline_stages[0].get_worker_info(type="raw_dict_please") # Assuming a way to get raw dict
+            self.max_total_num_tokens = worker_info_stage0["max_total_tokens"] # This needs careful thought
+            self.max_prefill_tokens = worker_info_stage0.get("max_prefill_tokens", server_args.max_prefill_tokens) # placeholder
+            self.max_running_requests = worker_info_stage0.get("max_running_requests", server_args.max_running_requests)
+            self.max_req_len = worker_info_stage0.get("context_len", self.model_config.context_len) # placeholder
+            self.max_req_input_len = self.max_req_len # placeholder
+            self.random_seed = server_args.random_seed # Use global random seed
+            self.device = server_args.device # Use global device
+            # worker_global_server_args_dict = {} # This might not be needed or needs merging
+            # global_server_args_dict.update(worker_global_server_args_dict)
+            set_random_seed(self.random_seed)
+            
+            # TODO: Memory pools and tree_cache are now per-stage.
+            # The scheduler's tree_cache might only be used for initial prefix matching on stage 0.
+            # For now, let's initialize it using stage 0's pools.
+            self.req_to_token_pool, self.token_to_kv_pool = self.pipeline_stages[0].get_memory_pool()
+            # The tp_cpu_group and pad_input_ids_func might also be stage-specific or need careful handling.
+            # For now, let's assume stage 0's is sufficient for the scheduler's current role.
+            self.tp_cpu_group = self.pipeline_stages[0].model_runner.tp_group # This needs to be the CPU group for dist ops
+            self.pad_input_ids_func = self.pipeline_stages[0].model_runner.model.pad_input_ids_func # Assuming model has this
+
+        else: # pp_size == 1
+            self.model_config = ModelConfig(
+                server_args.model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+                context_length=server_args.context_length,
+                model_override_args=server_args.json_model_override_args,
+                is_embedding=server_args.is_embedding,
+                dtype=server_args.dtype,
+                quantization=server_args.quantization,
+                # pipeline_parallel_size and pipeline_stage_rank default to 1 and 0 in ModelConfig
+            )
+            self.is_generation = self.model_config.is_generation
+
+            # Launch a tensor parallel worker
+            if self.enable_overlap:
+                TpWorkerClass = TpModelWorkerClient
+            else:
+                TpWorkerClass = TpModelWorker
+
+            self.tp_worker = TpWorkerClass(
+                server_args=server_args,
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                dp_rank=dp_rank,
+                nccl_port=port_args.nccl_port,
+            )
+
+            # Get token and memory info from the model worker
+            (
+                self.max_total_num_tokens,
+                self.max_prefill_tokens,
+                self.max_running_requests,
+                self.max_req_len,
+                self.max_req_input_len,
+                self.random_seed,
+                self.device,
+                worker_global_server_args_dict,
+                _,
+                _,
+                _,
+            ) = self.tp_worker.get_worker_info()
+            self.tp_cpu_group = self.tp_worker.get_tp_cpu_group()
+            self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
+            global_server_args_dict.update(worker_global_server_args_dict)
+            set_random_seed(self.random_seed)
+            # Init memory pool and cache for pp_size == 1
+            self.req_to_token_pool, self.token_to_kv_pool = self.tp_worker.get_memory_pool()
+
+        # Common initialization for tokenizer, regardless of PP, if not skipped
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
-            if self.model_config.is_multimodal:
+            if self.model_config.is_multimodal: # Use self.model_config which is set above
                 self.processor = get_processor(
                     server_args.tokenizer_path,
                     tokenizer_mode=server_args.tokenizer_mode,
@@ -170,75 +270,48 @@ class Scheduler:
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                 )
-
-        # Check whether overlap can be enabled
-        if not self.is_generation:
+        
+        # Common initialization for overlap and cache, regardless of PP
+        if not self.is_generation or self.model_config.is_multimodal or self.server_args.pipeline_parallel_size > 1: # Disable overlap for PP for now
             self.enable_overlap = False
-            logger.info("Overlap scheduler is disabled for embedding models.")
+            if self.server_args.pipeline_parallel_size > 1:
+                logger.info("Overlap scheduler is disabled for pipeline parallelism for now.")
+            # Other messages for embedding/multimodal remain as they were
 
-        if self.model_config.is_multimodal:
-            self.enable_overlap = False
-            logger.info("Overlap scheduler is disabled for multimodal models.")
-
-        if self.enable_overlap:
+        if self.enable_overlap: # This check happens after potential disabling for PP
             self.disable_jump_forward = True
+            if hasattr(self, 'tp_worker') and isinstance(self.tp_worker, TpModelWorker): # Re-init if it was TpModelWorker
+                 self.tp_worker = TpModelWorkerClient(
+                    server_args=server_args,
+                    gpu_id=gpu_id,
+                    tp_rank=tp_rank,
+                    dp_rank=dp_rank,
+                    nccl_port=port_args.nccl_port,
+                    # Pass existing worker info if needed, or let it re-init
+                )
 
-        # Launch a tensor parallel worker
-        if self.enable_overlap:
-            TpWorkerClass = TpModelWorkerClient
-        else:
-            TpWorkerClass = TpModelWorker
 
-        self.tp_worker = TpWorkerClass(
-            server_args=server_args,
-            gpu_id=gpu_id,
-            tp_rank=tp_rank,
-            dp_rank=dp_rank,
-            nccl_port=port_args.nccl_port,
-        )
-
-        # Get token and memory info from the model worker
-        (
-            self.max_total_num_tokens,
-            self.max_prefill_tokens,
-            self.max_running_requests,
-            self.max_req_len,
-            self.max_req_input_len,
-            self.random_seed,
-            self.device,
-            worker_global_server_args_dict,
-            _,
-            _,
-            _,
-        ) = self.tp_worker.get_worker_info()
-        self.tp_cpu_group = self.tp_worker.get_tp_cpu_group()
-        self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
-        global_server_args_dict.update(worker_global_server_args_dict)
-        set_random_seed(self.random_seed)
-
-        # Print debug info
+        # Print debug info (common part)
         logger.info(
             f"max_total_num_tokens={self.max_total_num_tokens}, "
             f"max_prefill_tokens={self.max_prefill_tokens}, "
             f"max_running_requests={self.max_running_requests}, "
             f"context_len={self.model_config.context_len}"
         )
-
-        # Init memory pool and cache
-        self.req_to_token_pool, self.token_to_kv_pool = self.tp_worker.get_memory_pool()
-
+        
+        # Common init for tree_cache and policy
         if (
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
         ):
             self.tree_cache = ChunkCache(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool=self.token_to_kv_pool,
+                req_to_token_pool=self.req_to_token_pool, # This is stage 0's pool if PP > 1
+                token_to_kv_pool=self.token_to_kv_pool,   # This is stage 0's pool if PP > 1
             )
         else:
             self.tree_cache = RadixCache(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool=self.token_to_kv_pool,
+                req_to_token_pool=self.req_to_token_pool, # Stage 0's
+                token_to_kv_pool=self.token_to_kv_pool,   # Stage 0's
                 disable=server_args.disable_radix_cache,
             )
         self.tree_cache_metrics = {"total": 0, "hit": 0}
@@ -522,6 +595,8 @@ class Scheduler:
                 input_embeds=recv_req.input_embeds,
             )
             req.tokenizer = self.tokenizer
+            if self.server_args.pipeline_parallel_size > 1:
+                req.processed_token_count_by_pipeline_stages = [0] * self.server_args.pipeline_parallel_size
 
             if recv_req.session_id is not None:
                 req.finished_reason = FINISH_ABORT(
@@ -557,6 +632,9 @@ class Scheduler:
                 req.finished_reason = FINISH_ABORT(
                     "Multimodal prompt is too long. Check server logs for details."
                 )
+            # Ensure processed_token_count_by_pipeline_stages is initialized even for aborted reqs if PP is on
+            if self.server_args.pipeline_parallel_size > 1 and req.processed_token_count_by_pipeline_stages is None:
+                 req.processed_token_count_by_pipeline_stages = [0] * self.server_args.pipeline_parallel_size
                 self.waiting_queue.append(req)
                 return
 
@@ -617,6 +695,8 @@ class Scheduler:
             recv_req.sampling_params,
         )
         req.tokenizer = self.tokenizer
+        if self.server_args.pipeline_parallel_size > 1:
+            req.processed_token_count_by_pipeline_stages = [0] * self.server_args.pipeline_parallel_size
 
         # Truncate prompts that are too long
         if len(req.origin_input_ids) >= self.max_req_input_len:
@@ -904,33 +984,232 @@ class Scheduler:
     def run_batch(self, batch: ScheduleBatch):
         """Run a batch."""
         self.forward_ct += 1
+        model_worker_batch = batch.get_model_worker_batch()
 
-        if self.is_generation:
-            model_worker_batch = batch.get_model_worker_batch()
-            if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
-                logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
-                    model_worker_batch
-                )
-            elif batch.forward_mode.is_idle():
-                model_worker_batch = batch.get_model_worker_batch()
-                self.tp_worker.forward_batch_idle(model_worker_batch)
-                return
-            else:
-                logits_output = None
-                if self.skip_tokenizer_init:
-                    next_token_ids = torch.full(
-                        (batch.batch_size(),), self.tokenizer.eos_token_id
+        if self.server_args.pipeline_parallel_size > 1:
+            return self.run_batch_pipeline(batch, model_worker_batch)
+        else: # Existing logic for pp_size == 1
+            if self.is_generation:
+                if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
+                    logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
+                        model_worker_batch
                     )
+                elif batch.forward_mode.is_idle():
+                    self.tp_worker.forward_batch_idle(model_worker_batch)
+                    return
+                else: # Should not happen if batch is not None and not idle
+                    logits_output = None
+                    if self.skip_tokenizer_init: # This branch seems problematic if tokenizer is None
+                        eos_token_id = self.tokenizer.eos_token_id if self.tokenizer else 2 # Fallback if skip_tokenizer_init
+                        next_token_ids = torch.full(
+                            (batch.batch_size(),), eos_token_id
+                        )
+                    else:
+                        next_token_ids = torch.full((batch.batch_size(),), 0) # Placeholder
+                batch.output_ids = next_token_ids
+                ret = logits_output, next_token_ids, model_worker_batch.bid
+            else:  # embedding or reward model
+                assert batch.extend_num_tokens != 0
+                embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
+                ret = embeddings, model_worker_batch.bid
+            return ret
+
+    def run_batch_pipeline(self, schedule_batch: ScheduleBatch, original_model_worker_batch: ModelWorkerBatch):
+        hidden_states: Optional[torch.Tensor] = None
+        final_logits_output: Optional[LogitsProcessorOutput] = None
+        final_next_token_ids: Optional[torch.Tensor] = None
+
+        for pp_rank in range(self.server_args.pipeline_parallel_size):
+            current_stage_executor = self.pipeline_stages[pp_rank]
+            current_stage_rank = pp_rank 
+
+            stage_input_ids_list = []
+            stage_global_positions_list = []
+            stage_seq_lens_for_kv_cache_list = []
+            stage_chunk_lengths_list = []
+            stage_extend_prefix_lens_list = [] # For extend mode, prefix for attention on this stage
+            
+            active_req_indices_in_schedule_batch = [] # Original indices from schedule_batch.reqs
+            
+            # Iterate through requests that are part of the original model_worker_batch from the scheduler
+            # This implicitly means these requests were deemed active by the scheduler for this pipeline pass.
+            for batch_req_idx, req in enumerate(original_model_worker_batch.model_worker_reqs):
+                # req here is from original_model_worker_batch.model_worker_reqs, which are Req objects
+                original_req_idx = schedule_batch.reqs.index(req) # Find original index if needed, or pass req directly
+
+                if req.finished_reason is not None:
+                    # This request might have finished in a previous stage of this same pipeline pass (e.g. error)
+                    # Or it was already finished before this pipeline pass started.
+                    # We need to ensure tensors still line up if other TP ranks are processing it.
+                    # For simplicity, if finished, we might add dummy/empty data for this rank if others are processing.
+                    # However, the send/recv logic for hidden states must be robust to this.
+                    # Current P2P send/recv assumes paired operations. If a rank drops out, it can hang.
+                    # This is a complex part of pipeline error handling and synchronization.
+                    # For now, assume if a req is finished, it won't be part of active computation for this stage.
+                    # The KV cache length should still be the current global length.
+                    if original_model_worker_batch.forward_mode.is_extend():
+                        stage_chunk_lengths_list.append(0)
+                        stage_extend_prefix_lens_list.append(0)
+                        stage_seq_lens_for_kv_cache_list.append(req.prefix_indices + req.processed_token_count_by_pipeline_stages[current_stage_rank]) # Best guess for KV length
+                    elif original_model_worker_batch.forward_mode.is_decode():
+                        stage_chunk_lengths_list.append(0) # No new tokens if finished
+                        stage_seq_lens_for_kv_cache_list.append(len(req.origin_input_ids) + len(req.output_ids))
+                    # We don't add it to active_req_indices_in_schedule_batch
+                    continue
+
+                active_req_indices_in_schedule_batch.append(original_req_idx)
+
+                if original_model_worker_batch.forward_mode.is_extend():
+                    global_input_ids_for_req = req.origin_input_ids + req.output_ids
+                    global_radix_prefix_len = len(req.prefix_indices)
+                    tokens_to_prefill_globally = global_input_ids_for_req[global_radix_prefix_len:]
+                    
+                    start_offset_in_global_prefill = req.processed_token_count_by_pipeline_stages[current_stage_rank]
+                    
+                    chunk_size = self.server_args.chunked_prefill_size if self.server_args.chunked_prefill_size > 0 else len(tokens_to_prefill_globally)
+                    num_tokens_for_stage_chunk = min(chunk_size, len(tokens_to_prefill_globally) - start_offset_in_global_prefill)
+
+                    if num_tokens_for_stage_chunk > 0:
+                        chunk_ids = tokens_to_prefill_globally[start_offset_in_global_prefill : start_offset_in_global_prefill + num_tokens_for_stage_chunk]
+                        stage_input_ids_list.append(list(chunk_ids)) # Store as list of lists
+                        
+                        global_start_pos_for_chunk = global_radix_prefix_len + start_offset_in_global_prefill
+                        chunk_positions = torch.arange(global_start_pos_for_chunk, global_start_pos_for_chunk + num_tokens_for_stage_chunk, device=self.device, dtype=torch.long)
+                        stage_global_positions_list.append(chunk_positions)
+                        stage_seq_lens_for_kv_cache_list.append(global_start_pos_for_chunk + num_tokens_for_stage_chunk)
+                        stage_chunk_lengths_list.append(num_tokens_for_stage_chunk)
+                        stage_extend_prefix_lens_list.append(global_radix_prefix_len if current_stage_rank == 0 else 0)
+                    else: 
+                        stage_input_ids_list.append([])
+                        stage_global_positions_list.append(torch.empty(0, dtype=torch.int64, device=self.device))
+                        current_global_seq_len = global_radix_prefix_len + start_offset_in_global_prefill 
+                        stage_seq_lens_for_kv_cache_list.append(current_global_seq_len)
+                        stage_chunk_lengths_list.append(0)
+                        stage_extend_prefix_lens_list.append(0)
+                        
+                elif original_model_worker_batch.forward_mode.is_decode():
+                    # original_model_worker_batch.input_ids is already flat here, corresponds to schedule_batch.reqs
+                    # We need to get the specific token for *this* req from the *original* batch sent by scheduler
+                    # This means original_model_worker_batch.input_ids must be correctly indexed if it was flattened.
+                    # Assuming original_model_worker_batch.input_ids[batch_req_idx] is the correct token for current `req`.
+                    stage_input_ids_list.append([original_model_worker_batch.input_ids[batch_req_idx].item()])
+                    pos = (len(req.origin_input_ids) + len(req.output_ids)) -1 # Current global length - 1
+                    stage_global_positions_list.append(torch.tensor([pos], dtype=torch.int64, device=self.device))
+                    stage_seq_lens_for_kv_cache_list.append(len(req.origin_input_ids) + len(req.output_ids))
+                    stage_chunk_lengths_list.append(1) 
+                    # stage_extend_prefix_lens_list is not used for decode
+
+            # Filter based on active requests for this stage if in extend mode. Decode processes all.
+            if original_model_worker_batch.forward_mode.is_extend():
+                active_model_worker_reqs = [schedule_batch.reqs[i] for i in active_req_indices_in_schedule_batch if stage_chunk_lengths_list[active_req_indices_in_schedule_batch.index(i)] > 0]
+                if not active_model_worker_reqs: # No requests have actual work for this stage
+                    if pp_rank > 0 and hidden_states is not None and hidden_states.numel() > 0 : # Must consume if previous stage sent something.
+                         pass # No op, but ensures hidden_states isn't accidentally passed to next iter if not consumed.
+                    hidden_states = None # Ensure no stale hidden_states
+                    if pp_rank < self.server_args.pipeline_parallel_size - 1 and hidden_states is not None and hidden_states.numel() > 0: # if somehow hidden_states is not None
+                         # This rank needs to send dummy/empty tensor if its TP peers are sending. Complex.
+                         # Simplification: If no active reqs, this rank does not participate in send for this batch.
+                         pass
+                    continue # Skip to next stage
+            else: # Decode mode
+                active_model_worker_reqs = schedule_batch.reqs # All reqs are active for computation
+
+            # Prepare flat tensors for ModelWorkerBatch
+            flat_stage_input_ids = torch.tensor([token for sublist in stage_input_ids_list for token in sublist if sublist], dtype=torch.int32, device=self.device)
+            flat_stage_global_positions = torch.cat(stage_global_positions_list) if stage_global_positions_list and any(t.numel() > 0 for t in stage_global_positions_list) else torch.empty(0, dtype=torch.int64, device=self.device)
+            
+            # Create ModelWorkerBatch for the current stage
+            # seq_lens for KV cache are global cumulative lengths.
+            # extend_seq_lens are the lengths of current chunks being processed.
+            # extend_prefix_lens are attention prefixes for current chunks.
+            model_worker_batch_for_stage = ModelWorkerBatch(
+                bid=original_model_worker_batch.bid,
+                forward_mode=original_model_worker_batch.forward_mode,
+                input_ids=flat_stage_input_ids,
+                global_positions=flat_stage_global_positions,
+                req_pool_indices=original_model_worker_batch.req_pool_indices[[schedule_batch.reqs.index(r) for r in active_model_worker_reqs]], # Filtered
+                seq_lens=torch.tensor([sl for i, sl in enumerate(stage_seq_lens_for_kv_cache_list) if (original_model_worker_batch.forward_mode.is_decode() or stage_chunk_lengths_list[i] > 0)], dtype=torch.int32, device=self.device),
+                out_cache_loc=original_model_worker_batch.out_cache_loc, # Needs per-stage management by MemManager
+                extend_seq_lens= [scl for scl in stage_chunk_lengths_list if (original_model_worker_batch.forward_mode.is_decode() or scl > 0)] if original_model_worker_batch.forward_mode.is_extend() else None,
+                extend_prefix_lens= [epl for i,epl in enumerate(stage_extend_prefix_lens_list) if (original_model_worker_batch.forward_mode.is_decode() or stage_chunk_lengths_list[i]>0)] if original_model_worker_batch.forward_mode.is_extend() else None,
+                seq_lens_sum=flat_stage_input_ids.numel(),
+                extend_num_tokens=flat_stage_input_ids.numel() if original_model_worker_batch.forward_mode.is_extend() else 0,
+                return_logprob=original_model_worker_batch.return_logprob if current_stage_rank == self.server_args.pipeline_parallel_size - 1 else False,
+                top_logprobs_nums=original_model_worker_batch.top_logprobs_nums if current_stage_rank == self.server_args.pipeline_parallel_size - 1 else None,
+                sampling_info=original_model_worker_batch.sampling_info if current_stage_rank == self.server_args.pipeline_parallel_size - 1 else None,
+                lora_paths=[req.lora_path for req in active_model_worker_reqs] if original_model_worker_batch.lora_paths else None,
+                input_embeds=original_model_worker_batch.input_embeds if current_stage_rank == 0 and req.processed_token_count_by_pipeline_stages[0] == 0 else None, # Simplified
+                model_worker_reqs=active_model_worker_reqs,
+                image_inputs=[req.image_inputs for req in active_model_worker_reqs] if current_stage_rank == 0 else None,
+            )
+            
+            # This check is important. If no tokens for this stage, skip forward, but handle send/recv carefully.
+            if model_worker_batch_for_stage.input_ids.numel() == 0 and model_worker_batch_for_stage.forward_mode.is_extend():
+                 if pp_rank > 0 and hidden_states is not None : # Consume if any was sent for safety, though ideally not sent if no work.
+                      pass 
+                 hidden_states = None 
+                 if pp_rank < self.server_args.pipeline_parallel_size -1 and hidden_states is not None: # if somehow hidden_states is not None
+                      pass
+                 continue
+
+
+            forward_batch_for_stage = ForwardBatch.init_new(
+                model_worker_batch_for_stage, 
+                current_stage_executor.model_runner 
+            )
+
+            # Receive hidden states from previous stage
+            if pp_rank > 0:
+                # Determine the shape of hidden states expected from the previous stage.
+                # This should correspond to the number of tokens processed by the previous stage for the currently active requests.
+                # This is complex because the set of active requests and their chunk lengths might differ per stage.
+                # For now, assume the received hidden_states matches the input needs of this stage's forward_batch_for_stage.input_ids.numel()
+                # This implies that the P2P communication is sending data corresponding to what this stage expects.
+                if forward_batch_for_stage.input_ids.numel() > 0 or forward_batch_for_stage.forward_mode.is_decode():
+                    expected_input_token_count = forward_batch_for_stage.input_ids.numel()
+                    if forward_batch_for_stage.forward_mode.is_decode(): # For decode, it's batch_size (number of active reqs)
+                        expected_input_token_count = len(model_worker_batch_for_stage.model_worker_reqs)
+                    
+                    if expected_input_token_count > 0:
+                        expected_shape = (expected_input_token_count, current_stage_executor.model_config.hidden_size)
+                        recv_buffer = torch.empty(expected_shape, dtype=current_stage_executor.model_config.dtype, device=self.device)
+                        
+                        prev_global_rank_for_tp = get_pipeline_stage_global_rank(current_stage_rank - 1, self.tp_rank)
+                        dist.recv(recv_buffer, src=prev_global_rank_for_tp) 
+                        hidden_states = recv_buffer
+                    else: # No tokens expected for this stage by this rank.
+                        hidden_states = None
                 else:
-                    next_token_ids = torch.full((batch.batch_size(),), 0)
-            batch.output_ids = next_token_ids
-            ret = logits_output, next_token_ids, model_worker_batch.bid
-        else:  # embedding or reward model
-            assert batch.extend_num_tokens != 0
-            model_worker_batch = batch.get_model_worker_batch()
-            embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
-            ret = embeddings, model_worker_batch.bid
-        return ret
+                    hidden_states = None
+
+
+            output_hidden_for_next, logits_output_stage, next_token_ids_stage = \
+                current_stage_executor.forward_pass(forward_batch_for_stage, hidden_states)
+
+            if original_model_worker_batch.forward_mode.is_extend():
+                 for i, req_original_idx in enumerate(active_req_indices_in_schedule_batch):
+                    # Only update if this req was part of the active model_worker_batch_for_stage
+                    # Need to map i (index in active_model_worker_reqs) back to req in schedule_batch
+                    if model_worker_batch_for_stage.model_worker_reqs and i < len(model_worker_batch_for_stage.model_worker_reqs):
+                        req_in_current_stage_batch = model_worker_batch_for_stage.model_worker_reqs[i]
+                        original_req_object = schedule_batch.reqs[schedule_batch.reqs.index(req_in_current_stage_batch)] # Find the original Req object
+                        
+                        num_processed_in_chunk = model_worker_batch_for_stage.extend_seq_lens[i] # This is a list now
+                        original_req_object.processed_token_count_by_pipeline_stages[pp_rank] += num_processed_in_chunk
+
+            hidden_states = output_hidden_for_next 
+
+            if pp_rank < self.server_args.pipeline_parallel_size - 1:
+                if output_hidden_for_next is not None and output_hidden_for_next.numel() > 0:
+                    next_global_rank_for_tp = get_pipeline_stage_global_rank(current_stage_rank + 1, self.tp_rank)
+                    dist.send(output_hidden_for_next, dst=next_global_rank_for_tp)
+            else: 
+                final_logits_output = logits_output_stage
+                final_next_token_ids = next_token_ids_stage
+        
+        schedule_batch.output_ids = final_next_token_ids 
+        return final_logits_output, final_next_token_ids, original_model_worker_batch.bid
+
 
     def process_batch_result(self, batch: ScheduleBatch, result):
         if batch.forward_mode.is_decode():

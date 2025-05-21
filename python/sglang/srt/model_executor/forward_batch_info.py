@@ -210,34 +210,38 @@ class ForwardBatch:
     @classmethod
     def init_new(
         cls,
-        batch: ModelWorkerBatch,
-        model_runner: ModelRunner,
+        batch: ModelWorkerBatch, # ModelWorkerBatch now includes stage-specific input_ids and other details
+        model_runner: ModelRunner, # ModelRunner for the current stage
     ):
-
         device = model_runner.device
+        current_stage_rank = model_runner.model_config.pipeline_stage_rank
+        # pipeline_parallel_size = model_runner.model_config.pipeline_parallel_size # Not directly used here but good for context
+
+        # hidden_states_from_previous_stage is set by PipelineStageExecutor directly on ForwardBatch instance
+        # It is not part of ModelWorkerBatch.
         ret = cls(
             forward_mode=batch.forward_mode,
-            batch_size=len(batch.seq_lens),
-            input_ids=batch.input_ids,
+            batch_size=len(batch.model_worker_reqs) if batch.model_worker_reqs is not None else 0,
+            input_ids=None, 
             req_pool_indices=batch.req_pool_indices,
-            seq_lens=batch.seq_lens,
-            out_cache_loc=batch.out_cache_loc,
-            image_inputs=batch.image_inputs,
-            encoder_cached=batch.encoder_cached,
+            seq_lens=None, # This will be the GLOBAL seq_len for KV cache, set below.
+            out_cache_loc=batch.out_cache_loc, 
+            image_inputs=batch.image_inputs if current_stage_rank == 0 else None, # Image inputs only for stage 0
+            encoder_cached=batch.encoder_cached, 
             encoder_lens=batch.encoder_lens,
             encoder_lens_cpu=batch.encoder_lens_cpu,
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
-            seq_lens_sum=batch.seq_lens_sum,
-            return_logprob=batch.return_logprob,
-            top_logprobs_nums=batch.top_logprobs_nums,
-            global_num_tokens=batch.global_num_tokens,
-            can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
-            lora_paths=batch.lora_paths,
-            sampling_info=batch.sampling_info,
-            input_embeds=batch.input_embeds,
+            seq_lens_sum=0, 
+            return_logprob=batch.return_logprob, 
+            top_logprobs_nums=batch.top_logprobs_nums, 
+            global_num_tokens=batch.global_num_tokens, 
+            can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph, 
+            lora_paths=batch.lora_paths, 
+            sampling_info=batch.sampling_info, 
+            input_embeds=batch.input_embeds if current_stage_rank == 0 else None,
         )
 
-        if ret.global_num_tokens is not None:
+        if ret.global_num_tokens is not None: 
             max_len = max(ret.global_num_tokens)
             ret.gathered_buffer = torch.zeros(
                 (max_len * model_runner.tp_size, model_runner.model_config.hidden_size),
@@ -248,32 +252,155 @@ class ForwardBatch:
         if ret.forward_mode.is_idle():
             return ret
 
-        # Init position information
-        if not ret.forward_mode.is_decode():
+        if ret.forward_mode.is_extend():
+            input_ids_for_stage_list = []
+            positions_for_stage_list = []
+            current_extend_seq_lens_list = [] 
+            # extend_prefix_lens for attention within this stage's current computation chunk.
+            current_extend_prefix_lens_list = [] 
+            
+            seq_lens_for_kv_cache_list = [] # Global length for KV cache addressing
+
+            assert batch.model_worker_reqs is not None, "model_worker_reqs must be provided for extend mode"
+
+            for req_idx, req in enumerate(batch.model_worker_reqs):
+                full_input_ids = req.origin_input_ids + req.output_ids
+                global_radix_prefix_len = len(req.prefix_indices) 
+                
+                tokens_to_prefill_globally = full_input_ids[global_radix_prefix_len:]
+                
+                # This is how many tokens of the "tokens_to_prefill_globally" part this stage has already processed.
+                start_offset_in_global_prefill_chunk = req.processed_token_count_by_pipeline_stages[current_stage_rank]
+                
+                chunk_size = model_runner.server_args.chunked_prefill_size
+                if chunk_size == -1: # Process all remaining for this request globally
+                    num_tokens_for_stage_chunk = len(tokens_to_prefill_globally) - start_offset_in_global_prefill_chunk
+                else: # Process one chunk
+                    num_tokens_for_stage_chunk = min(chunk_size, 
+                                               len(tokens_to_prefill_globally) - start_offset_in_global_prefill_chunk)
+
+                if num_tokens_for_stage_chunk <= 0: # This req is done with prefill on this stage or globally
+                    current_extend_seq_lens_list.append(0)
+                    current_extend_prefix_lens_list.append(0)
+                    # KV cache already contains up to global_radix_prefix_len + start_offset_in_global_prefill_chunk
+                    seq_lens_for_kv_cache_list.append(global_radix_prefix_len + start_offset_in_global_prefill_chunk)
+                    if not positions_for_stage_list and req_idx == 0 : 
+                        positions_for_stage_list.append(torch.empty(0, dtype=torch.long, device=device))
+                    continue
+
+                actual_input_ids_for_chunk = tokens_to_prefill_globally[
+                    start_offset_in_global_prefill_chunk : 
+                    start_offset_in_global_prefill_chunk + num_tokens_for_stage_chunk
+                ]
+                # Only stage 0 uses input_ids for embedding lookup. Other stages use hidden_states.
+                # However, model.forward might still expect input_ids for shape or other reasons.
+                # For simplicity, we pass the actual chunk of tokens for stage 0,
+                # and dummy tokens (or actual tokens if needed by model arch) for other stages.
+                # The Llama model in SGLang is modified to accept hidden_states_from_previous_stage.
+                if current_stage_rank == 0:
+                    input_ids_for_stage_list.extend(actual_input_ids_for_chunk)
+                else: 
+                    # For stages > 0, if the model uses hidden_states, input_ids might not be strictly needed
+                    # for computation but could be for length/shape. Using actual tokens or dummies depends
+                    # on specific model implementation. For now, assume actual tokens are passed but might not be used for embedding.
+                    input_ids_for_stage_list.extend(actual_input_ids_for_chunk)
+
+
+                global_start_pos_for_chunk = global_radix_prefix_len + start_offset_in_global_prefill_chunk
+                positions_for_chunk = torch.arange(
+                    global_start_pos_for_chunk,
+                    global_start_pos_for_chunk + num_tokens_for_stage_chunk,
+                    device=device, dtype=torch.long
+                )
+                positions_for_stage_list.append(positions_for_chunk)
+                
+                current_extend_seq_lens_list.append(num_tokens_for_stage_chunk)
+                
+                # The "prefix_len" for this stage's attention computation on the current chunk.
+                if current_stage_rank == 0:
+                    # Stage 0: prefix is the RadixCache hit. Tokens are new.
+                    current_extend_prefix_lens_list.append(global_radix_prefix_len)
+                else:
+                    # Stage > 0: receives hidden states for (Radix prefix + previous chunks).
+                    # The current chunk of tokens is new to this stage, so prefix for *this chunk's computation* is 0.
+                    current_extend_prefix_lens_list.append(0) 
+                                                              
+                seq_lens_for_kv_cache_list.append(global_start_pos_for_chunk + num_tokens_for_stage_chunk)
+
+            if input_ids_for_stage_list:
+                ret.input_ids = torch.tensor(input_ids_for_stage_list, dtype=torch.int32).to(device)
+                if positions_for_stage_list: 
+                    ret.positions = torch.cat(positions_for_stage_list)
+                else: 
+                     ret.positions = torch.empty(0, dtype=torch.long, device=device)
+            else: 
+                ret.input_ids = torch.empty(0, dtype=torch.int32, device=device)
+                ret.positions = torch.empty(0, dtype=torch.long, device=device)
+
+            ret.extend_seq_lens = torch.tensor(current_extend_seq_lens_list, dtype=torch.int32).to(device)
+            ret.extend_prefix_lens = torch.tensor(current_extend_prefix_lens_list, dtype=torch.int32).to(device) # Stage-local prefix for attention
+            
+            ret.extend_start_loc = torch.zeros_like(ret.extend_seq_lens)
+            if len(ret.extend_seq_lens) > 1: 
+                ret.extend_start_loc[1:] = torch.cumsum(ret.extend_seq_lens[:-1], dim=0)
+            
+            ret.seq_lens = torch.tensor(seq_lens_for_kv_cache_list, dtype=torch.int32).to(device) # Global KV cache length
+            ret.extend_num_tokens = sum(current_extend_seq_lens_list) # Number of tokens this stage processes in this batch
+            ret.seq_lens_sum = ret.seq_lens.sum().item() if ret.seq_lens.numel() > 0 else 0
+
+            ret.extend_prefix_lens_cpu = current_extend_prefix_lens_list 
+            ret.extend_seq_lens_cpu = current_extend_seq_lens_list
+            ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens # Needs stage-specific logic if used beyond stage 0
+
+        elif ret.forward_mode.is_decode():
+            ret.positions = (batch.seq_lens - 1).to(torch.int64)
+            # input_ids for decode is the single token. For stage 0 or if model needs it.
+            # Other stages primarily use hidden_states.
+            ret.input_ids = batch.input_ids # This comes from ModelWorkerBatch, should be single token for last stage.
+                                            # For intermediate stages, this might be None if model doesn't need it.
+            ret.seq_lens = batch.seq_lens # Global seq_len for KV cache
+            ret.seq_lens_sum = ret.seq_lens.sum().item() if ret.seq_lens.numel() > 0 else 0
+
+        elif ret.forward_mode.is_mixed():
+            # This mode is complex and assumes ModelWorkerBatch is correctly populated by Scheduler
+            # This means model_worker_batch.input_ids, .positions etc. are already segmented for this stage.
+            ret.input_ids = batch.input_ids 
+            ret.positions = batch.positions 
+            
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
-            ).to(device, non_blocking=True)
+            ).to(device, non_blocking=True) 
             ret.extend_prefix_lens = torch.tensor(
                 batch.extend_prefix_lens, dtype=torch.int32
-            ).to(device, non_blocking=True)
-            if model_runner.server_args.attention_backend != "torch_native":
-                ret.extend_num_tokens = batch.extend_num_tokens
-                ret.positions, ret.extend_start_loc = compute_position_triton(
-                    ret.extend_prefix_lens, ret.extend_seq_lens, ret.extend_num_tokens
-                )
-            else:
-                ret.positions, ret.extend_start_loc = compute_position_torch(
-                    ret.extend_prefix_lens, ret.extend_seq_lens
-                )
+            ).to(device, non_blocking=True) 
+            
+            ret.extend_num_tokens = batch.extend_num_tokens 
+            
+            ret.extend_start_loc = torch.zeros_like(ret.extend_seq_lens) 
+            if len(ret.extend_seq_lens) > 1:
+                 ret.extend_start_loc[1:] = torch.cumsum(ret.extend_seq_lens[:-1], dim=0)
+            
+            ret.seq_lens = batch.seq_lens 
+            ret.seq_lens_sum = ret.seq_lens.sum().item() if ret.seq_lens.numel() > 0 else 0
+            
             ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
             ret.extend_seq_lens_cpu = batch.extend_seq_lens
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
 
-        if model_runner.model_is_mrope:
-            ret.compute_mrope_positions(model_runner, batch)
 
-        # Init attention information
-        ret.req_to_token_pool = model_runner.req_to_token_pool
+        if model_runner.model_is_mrope:
+            if batch.mrope_positions is not None: 
+                 ret.mrope_positions = batch.mrope_positions
+            elif ret.positions is not None : 
+                 # Fallback for mROPE if not explicitly provided, might need scheduler to ensure correctness
+                 # For simplicity, this doesn't re-calculate here but relies on batch.mrope_positions
+                 pass
+
+
+        # hidden_states_from_previous_stage will be set by PipelineStageExecutor if not the first stage
+        # ret.hidden_states_from_previous_stage = batch.hidden_states_from_previous_stage # This is NOT from ModelWorkerBatch
+
+        ret.req_to_token_pool = model_runner.req_to_token_pool 
         ret.token_to_kv_pool = model_runner.token_to_kv_pool
         ret.attn_backend = model_runner.attn_backend
 

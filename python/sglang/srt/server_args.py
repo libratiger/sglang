@@ -97,6 +97,9 @@ class ServerArgs:
     # Expert parallelism
     ep_size: int = 1
 
+    # Pipeline parallelism
+    pipeline_parallel_size: int = 1
+
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
     nnodes: int = 1
@@ -564,6 +567,15 @@ class ServerArgs:
             help="The expert parallelism size.",
         )
 
+        # Pipeline parallelism
+        parser.add_argument(
+            "--pipeline-parallel-size",
+            "--pp-size",
+            type=int,
+            default=ServerArgs.pipeline_parallel_size,
+            help="Number of pipeline stages.",
+        )
+
         # Multi-node distributed serving
         parser.add_argument(
             "--dist-init-addr",
@@ -814,12 +826,44 @@ class ServerArgs:
             return f"http://{self.host}:{self.port}"
 
     def check_server_args(self):
+        # Determine world_size. This might need to be adjusted if WORLD_SIZE env var is the source of truth.
+        # For now, assume world_size is the product of tp, pp, and dp sizes.
+        # This check is more about internal consistency of arguments.
+        world_size_from_args = self.tp_size * self.pipeline_parallel_size * self.dp_size
+        
+        # If dist_init_addr is not set (single node), world_size should match the product.
+        # If dist_init_addr is set, the actual world_size will be determined by the distributed init,
+        # but the product of parallel sizes should still ideally match what's expected for the cluster.
+        # For now, let's assume nnodes * tp_size_per_node (which is self.tp_size / self.nnodes if tp_size is global)
+        # should reconcile with world_size.
+        # A simpler check for now:
+        if self.nnodes > 1 and self.dist_init_addr is not None:
+            # In multi-node, tp_size is often per-node, but here it seems to be global.
+            # The crucial part is that total ranks = tp_size * pp_size * dp_size
+            # And total ranks should also be nnodes * (gpus_per_node)
+            # Let's assume self.tp_size is the *total* tensor parallel size across all nodes.
+             pass # Defer more complex world_size check to distributed init time if needed.
+        elif self.nnodes == 1:
+            # For a single node, the product of parallelisms should define the local world size.
+            # If WORLD_SIZE env var is set, it should match this product.
+            env_world_size = os.environ.get("WORLD_SIZE")
+            if env_world_size is not None:
+                assert world_size_from_args == int(env_world_size), \
+                    f"Product of tp_size ({self.tp_size}), pipeline_parallel_size ({self.pipeline_parallel_size}), " \
+                    f"and dp_size ({self.dp_size}) which is {world_size_from_args} " \
+                    f"does not match WORLD_SIZE environment variable ({env_world_size})."
+        
         assert (
             self.tp_size % self.nnodes == 0
         ), "tp_size must be divisible by number of nodes"
         assert not (
             self.dp_size > 1 and self.nnodes != 1
         ), "multi-node data parallel is not supported"
+        
+        # The check for num_hidden_layers divisibility by pipeline_parallel_size
+        # is already handled in ModelConfig, which is appropriate as it has access to hf_config.
+        # No need to duplicate it here directly with hf_config, but we rely on ModelConfig's check.
+
         assert (
             self.max_loras_per_batch > 0
             # FIXME
