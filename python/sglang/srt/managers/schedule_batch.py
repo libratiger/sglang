@@ -304,6 +304,11 @@ class Req:
         # The number of cached tokens, that were already cached in the KV cache
         self.cached_tokens = 0
 
+        # For pipeline parallelism
+        # This will be initialized by the Scheduler based on pipeline_parallel_size
+        # when the Req object is first processed by the scheduler.
+        self.processed_token_count_by_pipeline_stages: Optional[List[int]] = None
+
     def extend_image_inputs(self, image_inputs):
         if self.image_inputs is None:
             self.image_inputs = image_inputs
@@ -385,12 +390,18 @@ class Req:
 
         if self.to_abort:
             self.finished_reason = FINISH_ABORT()
+            # Reset pipeline stage counters on abort
+            if self.processed_token_count_by_pipeline_stages:
+                self.processed_token_count_by_pipeline_stages = [0] * len(self.processed_token_count_by_pipeline_stages)
             return
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
             self.finished_reason = FINISH_LENGTH(
                 length=self.sampling_params.max_new_tokens
             )
+            # Reset pipeline stage counters on finish
+            if self.processed_token_count_by_pipeline_stages:
+                self.processed_token_count_by_pipeline_stages = [0] * len(self.processed_token_count_by_pipeline_stages)
             return
 
         last_token_id = self.output_ids[-1]
@@ -406,6 +417,9 @@ class Req:
                 matched_eos |= last_token_id in self.tokenizer.additional_stop_token_ids
         if matched_eos and not self.sampling_params.ignore_eos:
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=last_token_id)
+            # Reset pipeline stage counters on finish
+            if self.processed_token_count_by_pipeline_stages:
+                self.processed_token_count_by_pipeline_stages = [0] * len(self.processed_token_count_by_pipeline_stages)
             return
 
         # Check stop strings
@@ -417,6 +431,9 @@ class Req:
             for stop_str in self.sampling_params.stop_strs:
                 if stop_str in tail_str or stop_str in self.decoded_text:
                     self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
+                    # Reset pipeline stage counters on finish
+                    if self.processed_token_count_by_pipeline_stages:
+                        self.processed_token_count_by_pipeline_stages = [0] * len(self.processed_token_count_by_pipeline_stages)
                     return
 
     def jump_forward_and_retokenize(self, jump_forward_str, next_state):
@@ -1206,6 +1223,9 @@ class ModelWorkerBatch:
 
     # The input Embeds
     input_embeds: Optional[torch.tensor] = None
+    # The global positions of input tokens for each stage.
+    # This is needed by ForwardBatch.init_new for pipeline parallelism.
+    global_positions: Optional[torch.Tensor] = None
 
 
 @triton.jit

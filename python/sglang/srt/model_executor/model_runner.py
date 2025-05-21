@@ -689,13 +689,17 @@ class ModelRunner:
 
     def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
         if forward_batch.forward_mode.is_decode():
+            # For decode, input_ids are always used.
+            # hidden_states_from_previous_stage is handled inside LlamaModel if not stage 0
             return self.forward_decode(forward_batch)
         elif forward_batch.forward_mode.is_extend():
+            # For extend, input_ids or input_embeds (from ForwardBatch) or hidden_states_from_previous_stage are used.
+            # LlamaModel.forward handles the logic of using hidden_states_from_previous_stage if available.
             return self.forward_extend(forward_batch)
         elif forward_batch.forward_mode.is_idle():
             return self.forward_idle(forward_batch)
         else:
-            raise ValueError(f"Invaid forward mode: {forward_batch.forward_mode}")
+            raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
     def sample(
         self, logits_output: LogitsProcessorOutput, forward_batch: ForwardBatch
